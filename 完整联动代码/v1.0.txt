@@ -1,0 +1,1250 @@
+/* ========================================================================
+   奶茶机器人 主控固件 v1.0  (Arduino Mega 2560, 单文件)
+   ------------------------------------------------------------------------
+   硬件接线(当前)：
+     HX711 秤     DT=D2  SCK=D3   (一台秤，一次一杯，净重出液)
+     DP1 隔膜泵   茶汤   继电器 IN1=D6   SRD-24VDC-SL-C / H档 / HIGH吸合
+     VALVE 气缸   继电器 IN2=D7   单线圈 HIGH伸出 LOW缩回(点动500ms)
+     PP1 蠕动泵   竹蔗冰糖浆 RS485:
+                     D18(TX1) -> 485模块 RXD
+                     D19(RX1) -> 485模块 TXD
+                     D8       -> 485模块 EN (HIGH=发送)
+                     从站0x01 / 115200 8N1 / 转速 36000 = 360.00rpm
+                     正常出液方向 = 逆时针 (寄存器0x0065 写1)
+
+   正常流程：
+     发订单 "1 1 0 0"(SKU 杯型 糖度 冰) -> 20秒内放空杯
+     -> 14g持续800ms放稳 -> 自动去皮 -> DP1/PP1 错峰150ms同时出液
+     -> g/s估算分泵到量停(未标定时总重到量一起停) + 秤总重兜底
+     -> PP1停后自动回吸300ms -> 判稳 -> 等10秒(移杯) -> 气缸点动500ms
+     -> 检测杯子取走 -> 自动去皮 -> 回待机
+
+   调试：发 DEBUG 进入(制作中会等当前杯做完)，发 RUN 存EEPROM并退出
+   急停：任何状态下发 r = 泵/气缸/485 全停
+   ======================================================================== */
+
+#include <EEPROM.h>
+#include <string.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include <math.h>
+#include <stdint.h>
+
+/* ========================================================================
+   ① 容量定义（加泵/加品类只改这里 + 下面的安装表/配方表）
+   ======================================================================== */
+#define DP_MAX    6              // 隔膜泵最多6台 (当前只装 DP1)
+#define PP_MAX    3              // 蠕动泵最多3台 (当前只装 PP1)
+#define SKU_MAX   5              // 品类最多5款 (当前只有 SKU1 糯香柠檬茶)
+#define CUP_N     2              // 0=中杯M 1=大杯L
+#define SUGAR_N   3              // 0=少糖 1=正常糖 2=多糖
+#define ICE_N     2              // 0=去冰 1=加冰
+
+/* ---------------- 引脚 ---------------- */
+#define HX_DT     2
+#define HX_SCK    3
+
+// 隔膜泵继电器引脚：DP1=D6。以后加泵推荐 DP2=D4 DP3=D5 DP4=D11 DP5=D12 DP6=D13
+const uint8_t dpPin[DP_MAX]      = { 6, 4, 5, 11, 12, 13 };
+const bool    dpInstalled[DP_MAX] = { true, false, false, false, false, false };
+
+// 蠕动泵：一泵一个485模块各占一个串口。PP1=Serial1/EN=D8
+//        以后 PP2=Serial2(D17发D16收)/EN=D9, PP3=Serial3(D15发D14收)/EN=D10
+const uint8_t ppEnPin[PP_MAX]    = { 8, 9, 10 };
+const bool    ppInstalled[PP_MAX] = { true, false, false };
+const uint8_t ppAddr[PP_MAX]     = { 0x01, 0x02, 0x03 };   // 以后同总线时再议
+
+#define VALVE_PIN 7
+
+/* ---------------- 继电器极性(H档：高电平吸合) ---------------- */
+const int RELAY_ON  = HIGH;
+const int RELAY_OFF = LOW;
+
+/* ========================================================================
+   ② 时间/重量参数区（以后要改时间，主要就改这里；运行时也可用 SET 改并存EEPROM）
+   ======================================================================== */
+#define DEFA_CUP_WAIT_MS     20000UL  // 下单后等放杯窗口 20秒
+#define DEFA_MOVE_WAIT_MS    10000UL  // 全部停+判稳后，等10秒再压盖(给移杯用)
+#define DEFA_VALVE_PULSE_MS  500UL    // 气缸点动 500ms
+#define DEFA_SUCK_MS         300UL    // PP1停后自动回吸时长
+#define DEFA_CUP_TRIG_G      14.0f    // 放杯触发重量
+#define DEFA_CUP_CONFIRM_MS  800UL    // 放稳确认时长
+#define DEFA_CUP_STABLE_G    1.0f     // 确认期内允许波动
+#define DEFA_STABLE_G        0.5f     // 判稳死区
+#define DEFA_STABLE_MS       800UL    // 判稳持续
+#define DEFA_STABLE_TIMEOUT  15000UL  // 判稳最长等待，超时也继续
+#define DEFA_NOFLOW_MS       8000UL   // 空转检测窗口
+#define DEFA_NOFLOW_G        8.0f     // 该窗口总重增量小于此值 = 堵管/空转
+#define DEFA_PUMP_TIMEOUT_MS 45000UL  // 单泵最长运行
+#define DEFA_OVERFILL_G      10.0f    // 总重超配方总和这么多 = 溢出故障
+#define DEFA_CALF_MAX_G      450.0f   // 标定时总重上限
+#define DEFA_PP_SPEED        36000U   // 蠕动泵转速(0.01rpm) 36000=360rpm
+#define DEFA_START_GAP_MS    150UL    // 多泵错峰启动间隔(停泵不错峰)
+#define DEFA_DP_PRECOMP_G    5.0f     // 隔膜泵提前量(关泵后冲出来的量)
+#define DEFA_PP_PRECOMP_G    1.0f     // 蠕动泵提前量
+
+#define HX_READ_TIMEOUT_MS   50       // HX711单次读数等待上限
+#define MB_RESP_TIMEOUT_MS   180      // Modbus应答超时
+#define MB_RETRIES           3        // 关键帧重发次数
+
+/* ========================================================================
+   ③ 配方表
+   ======================================================================== */
+struct Recipe {
+  float dp[DP_MAX];   // 各隔膜泵出液克数，0=该泵不出液
+  float pp[PP_MAX];   // 各蠕动泵出液克数，0=该泵不出液
+};
+
+struct Config {
+  uint16_t magic;
+  uint16_t version;
+  uint16_t ppSpeed;                              // 蠕动泵转速 0.01rpm
+  float    preDp[DP_MAX];                        // 隔膜泵提前量
+  float    prePp[PP_MAX];                        // 蠕动泵提前量
+  float    gpsDp[DP_MAX];                        // 隔膜泵实测流量 g/s (0=未标定)
+  float    gpsPp[PP_MAX];                        // 蠕动泵实测流量 g/s
+  uint32_t cupWaitMs, moveWaitMs, valvePulseMs, suckMs;
+  float    cupTrigG;
+  uint32_t cupConfirmMs;
+  uint32_t noflowMs;
+  float    noflowG;
+  uint32_t pumpTimeoutMs;
+  Recipe   recipe[SKU_MAX][CUP_N][SUGAR_N][ICE_N];
+  uint16_t crc;
+};
+
+#define CFG_MAGIC   0x4D54     // "MT"
+#define CFG_VERSION 2
+#define CAL_MAGIC   0x4341     // "CA"
+
+struct CalBlob {                 // 秤校准单独存，RESETCFG 不动它
+  uint16_t magic;
+  float    factor;
+  uint16_t crc;
+};
+
+Config cfg;
+float  calFactor = 385.3f;       // HX711 校准系数(净重换算)，EEPROM里有就用EEPROM
+
+/* ---- 默认配方：SKU1 糯香柠檬茶 (DP1=茶汤, PP1=竹蔗冰糖浆) ---- */
+void setDefaultConfig() {
+  memset(&cfg, 0, sizeof(cfg));
+  cfg.magic = CFG_MAGIC;
+  cfg.version = CFG_VERSION;
+  cfg.ppSpeed = DEFA_PP_SPEED;
+  for (int i = 0; i < DP_MAX; i++) cfg.preDp[i] = DEFA_DP_PRECOMP_G;
+  for (int i = 0; i < PP_MAX; i++) cfg.prePp[i] = DEFA_PP_PRECOMP_G;
+  // gpsDp/gpsPp 保持 0 = 未标定
+  cfg.cupWaitMs    = DEFA_CUP_WAIT_MS;
+  cfg.moveWaitMs   = DEFA_MOVE_WAIT_MS;
+  cfg.valvePulseMs = DEFA_VALVE_PULSE_MS;
+  cfg.suckMs       = DEFA_SUCK_MS;
+  cfg.cupTrigG     = DEFA_CUP_TRIG_G;
+  cfg.cupConfirmMs = DEFA_CUP_CONFIRM_MS;
+  cfg.noflowMs     = DEFA_NOFLOW_MS;
+  cfg.noflowG      = DEFA_NOFLOW_G;
+  cfg.pumpTimeoutMs = DEFA_PUMP_TIMEOUT_MS;
+
+  // ====== SKU1 糯香柠檬茶 ======
+  // 中杯 M(cup=0)
+  cfg.recipe[0][0][0][0] = { {356.5,0,0,0,0,0}, {24,0,0} };   // 少糖 去冰
+  cfg.recipe[0][0][1][0] = { {340.5,0,0,0,0,0}, {40,0,0} };   // 正常糖 去冰
+  cfg.recipe[0][0][2][0] = { {324.5,0,0,0,0,0}, {56,0,0} };   // 多糖 去冰
+  cfg.recipe[0][0][0][1] = { {276.5,0,0,0,0,0}, {24,0,0} };   // 少糖 加冰(制冰机待装)
+  cfg.recipe[0][0][1][1] = { {260.5,0,0,0,0,0}, {40,0,0} };
+  cfg.recipe[0][0][2][1] = { {244.5,0,0,0,0,0}, {56,0,0} };
+  // 大杯 L(cup=1) 去冰
+  cfg.recipe[0][1][0][0] = { {536,0,0,0,0,0}, {34,0,0} };
+  cfg.recipe[0][1][1][0] = { {514,0,0,0,0,0}, {56,0,0} };
+  cfg.recipe[0][1][2][0] = { {492,0,0,0,0,0}, {78,0,0} };
+  // 大杯 L 加冰 = 待你补数据，保持全0；点到会告警不出液
+  // SKU2~SKU5 保持全0(空品类)，点到会提示未上架
+}
+
+/* ========================================================================
+   ④ 运行状态
+   ======================================================================== */
+enum MachState {
+  ST_IDLE = 0,      // 待机，等订单
+  ST_WAIT_CUP,      // 已下单，等放杯
+  ST_FILL,          // 出液中
+  ST_SETTLE,        // 停泵后判稳
+  ST_WAIT_MOVE,     // 判稳后等10秒(移杯)
+  ST_VALVE,         // 气缸点动中
+  ST_FINISH,        // 等取杯 -> 去皮 -> 待机
+  ST_FAULT          // 故障，发 r 复位
+};
+const char* stateName(uint8_t s) {
+  static const char* n[] = {"IDLE","WAIT_CUP","FILL","SETTLE","WAIT_MOVE","VALVE","FINISH","FAULT"};
+  return n[s < 8 ? s : 0];
+}
+
+uint8_t  machState = ST_IDLE;
+bool     debugMode = false;    // 调试模式(禁止自动流程)
+bool     debugWanted = false;  // 制作中收到DEBUG，做完当前杯再进
+bool     bridgeMode = false;
+
+// HX711
+long     hxLastRaw = 0;
+bool     hxHas = false;
+float    hxEma = 0;
+bool     hxEmaHas = false;
+long     hxOffset = 0;
+unsigned long lastWChangeMs = 0;
+float    hxLastW = 0;
+bool     rawStream = false;
+
+// 订单
+uint8_t ordSku=0, ordCup=0, ordSugar=0, ordIce=0;
+unsigned long stateT0 = 0;          // 进入当前状态的时刻
+unsigned long cupSeenT = 0;         // 放杯检测
+bool cupConfirmed = false;
+float cupMinW=0, cupMaxW=0;
+unsigned long settleT0 = 0;
+bool pendingEmptyTare = false;      // 急停/故障后，检测到杯子取走再自动去皮
+
+// 气缸
+bool valveOn = false;
+unsigned long valveOffAt = 0;
+
+// 出液运行时
+struct FillCtx {
+  bool active;
+  bool modeA;                       // true=g/s分泵  false=总重一起停
+  float totalTgt;
+  bool  dRun[DP_MAX], dStarted[DP_MAX];
+  unsigned long dT0[DP_MAX];
+  float dTgt[DP_MAX];
+  bool  pRun[PP_MAX], pStarted[PP_MAX], pSuck[PP_MAX];
+  unsigned long pT0[PP_MAX], pSuckEnd[PP_MAX];
+  float pTgt[PP_MAX];
+  unsigned long firstStart;
+  float flowRefW;
+  unsigned long flowRefT;
+} fc;
+
+// CALF 自动流量标定
+struct CalfCtx {
+  bool active;
+  uint8_t kind;          // 0=DP 1=PP
+  uint8_t idx;
+  uint8_t step;          // 1=运行中 2=判稳中
+  unsigned long t0;
+  float w0;
+  float seconds;
+} calf;
+
+// Modbus 运行参数(可用 BAUD/PARITY 临时改)
+unsigned long mbBaud = 115200;
+int mbParity = 0;       // 0=N 1=E 2=O
+uint8_t mbFails[PP_MAX] = {0,0,0};
+
+// 串口
+char cmdBuf[80];
+int  cmdLen = 0;
+unsigned long lastCharMs = 0;
+unsigned long lastPrintMs = 0;
+
+/* ========================================================================
+   ⑤ EEPROM
+   ======================================================================== */
+uint16_t crc16Blob(const uint8_t* d, uint16_t n) {
+  uint16_t crc = 0xFFFF;
+  for (uint16_t i = 0; i < n; i++) {
+    crc ^= d[i];
+    for (uint8_t b = 0; b < 8; b++)
+      crc = (crc & 1) ? (uint16_t)((crc >> 1) ^ 0xA001) : (uint16_t)(crc >> 1);
+  }
+  return crc;
+}
+void saveConfig() {
+  cfg.crc = crc16Blob((const uint8_t*)&cfg, (uint16_t)((uint8_t*)&cfg.crc - (uint8_t*)&cfg));
+  EEPROM.put(0, cfg);
+}
+bool loadConfig() {
+  Config tmp;
+  EEPROM.get(0, tmp);
+  if (tmp.magic != CFG_MAGIC || tmp.version != CFG_VERSION) return false;
+  uint16_t c = crc16Blob((const uint8_t*)&tmp, (uint16_t)((uint8_t*)&tmp.crc - (uint8_t*)&tmp));
+  if (c != tmp.crc) return false;
+  cfg = tmp;
+  return true;
+}
+void saveCal() {
+  CalBlob b;
+  b.magic = CAL_MAGIC;
+  b.factor = calFactor;
+  b.crc = crc16Blob((const uint8_t*)&b, (uint16_t)((uint8_t*)&b.crc - (uint8_t*)&b));
+  int addr = (int)sizeof(Config) + 8;
+  EEPROM.put(addr, b);
+}
+bool loadCal() {
+  CalBlob b;
+  int addr = (int)sizeof(Config) + 8;
+  EEPROM.get(addr, b);
+  if (b.magic != CAL_MAGIC) return false;
+  uint16_t c = crc16Blob((const uint8_t*)&b, (uint16_t)((uint8_t*)&b.crc - (uint8_t*)&b));
+  if (c != b.crc) return false;
+  calFactor = b.factor;
+  return true;
+}
+
+/* ========================================================================
+   ⑥ HX711 非阻塞读取 (10SPS，DOUT变低=新数据，自带超时不死等)
+   ======================================================================== */
+bool hxReadRaw(long &out) {
+  unsigned long t0 = millis();
+  while (digitalRead(HX_DT) != LOW) {
+    if (millis() - t0 >= HX_READ_TIMEOUT_MS) return false;
+  }
+  unsigned long v = 0;
+  for (int i = 0; i < 24; i++) {
+    digitalWrite(HX_SCK, HIGH);
+    v = (v << 1) | (digitalRead(HX_DT) ? 1UL : 0UL);
+    digitalWrite(HX_SCK, LOW);
+  }
+  long r = (long)((unsigned long)v << 8) >> 8;   // 24位补码
+  digitalWrite(HX_SCK, HIGH);                    // 第25脉冲 增益128
+  delayMicroseconds(1);
+  digitalWrite(HX_SCK, LOW);
+  out = r;
+  return true;
+}
+
+void hxPoll() {
+  if (!hxHas || digitalRead(HX_DT) == LOW) {
+    long r;
+    if (hxReadRaw(r)) {
+      hxLastRaw = r;
+      hxHas = true;
+      if (!hxEmaHas) { hxEma = (float)r; hxEmaHas = true; }
+      else hxEma += 0.4f * ((float)r - hxEma);    // EMA
+      float w = (hxEma - (float)hxOffset) / calFactor;
+      if (fabsf(w - hxLastW) > DEFA_STABLE_G) lastWChangeMs = millis();
+      hxLastW = w;
+    }
+  }
+}
+
+bool hxTare() {                       // 阻塞约0.8s(仅待机/放杯后调用)
+  long sum = 0; int n = 0;
+  unsigned long t0 = millis();
+  while (n < 8 && millis() - t0 < 1500) {
+    long r;
+    if (hxReadRaw(r)) { sum += r; n++; }
+  }
+  if (n < 4) return false;
+  hxOffset = sum / n;
+  hxLastW = 0; hxEma = (float)hxOffset; hxEmaHas = true;
+  lastWChangeMs = millis();
+  return true;
+}
+
+// 判稳：hxPoll 每次新采样若变化>0.5g 就刷新 lastWChangeMs，这里只看持续时间
+bool hxStable(float deadG, unsigned long ms) {
+  (void)deadG;   // 死区统一在 hxPoll 用 DEFA_STABLE_G
+  return millis() - lastWChangeMs >= ms;
+}
+
+/* ========================================================================
+   ⑦ 输出底层：继电器 / 气缸 / 急停
+   ======================================================================== */
+void dpWrite(uint8_t i, bool on) {
+  digitalWrite(dpPin[i], on ? RELAY_ON : RELAY_OFF);
+}
+void ppStopQuiet(uint8_t pi);   // 前向声明：急停里要立刻给蠕动泵发STOP
+void valveWrite(bool on) {
+  digitalWrite(VALVE_PIN, on ? RELAY_ON : RELAY_OFF);
+  valveOn = on;
+}
+void valvePulse(unsigned long ms) {
+  valveWrite(true);
+  valveOffAt = millis() + ms;
+}
+void serviceValve() {
+  if (valveOn && valveOffAt != 0 && millis() >= valveOffAt) {
+    valveWrite(false);
+    valveOffAt = 0;
+  }
+}
+void allStop(const char* why) {
+  for (int i = 0; i < DP_MAX; i++) if (dpInstalled[i]) dpWrite(i, false);
+  valveWrite(false); valveOffAt = 0;
+  // 蠕动泵发 STOP(尽力一次不读应答，不在这里拖时间)
+  for (int i = 0; i < PP_MAX; i++) {
+    if (ppInstalled[i]) ppStopQuiet(i);
+  }
+  memset(&fc, 0, sizeof(fc));
+  calf.active = false;
+  Serial.print(F(">>> 全部停止"));
+  if (why) { Serial.print(F(" (")); Serial.print(why); Serial.print(F(")")); }
+  Serial.println(F(" <<<"));
+}
+
+/* ========================================================================
+   ⑧ Modbus RTU (动态CRC，绝不硬编码)
+   ======================================================================== */
+HardwareSerial* ppSer[PP_MAX] = { &Serial1, &Serial2, &Serial3 };
+
+uint16_t mbCrc(const uint8_t* d, uint8_t n) {
+  return crc16Blob(d, n);
+}
+void mbHex(const uint8_t* d, uint8_t n) {
+  static const char* h = "0123456789ABCDEF";
+  for (uint8_t i = 0; i < n; i++) { Serial.print(h[d[i]>>4]); Serial.print(h[d[i]&0xF]); Serial.print(' '); }
+}
+void ppDirLine(uint8_t pi, bool tx) { digitalWrite(ppEnPin[pi], tx ? HIGH : LOW); }
+void ppBegin(uint8_t pi) {
+  uint8_t cfg = mbParity == 1 ? SERIAL_8E1 : mbParity == 2 ? SERIAL_8O1 : SERIAL_8N1;
+  ppSer[pi]->begin(mbBaud, cfg);
+}
+
+bool mbGetResp(uint8_t pi, unsigned long timeoutMs) {
+  uint8_t buf[32], n = 0;
+  unsigned long t0 = millis(), last = t0;
+  unsigned long gap = (35000UL / (mbBaud ? mbBaud : 9600)) + 1;
+  if (gap < 2) gap = 2;
+  HardwareSerial &s = *ppSer[pi];
+  while (millis() - t0 < timeoutMs) {
+    while (s.available() && n < sizeof(buf)) { buf[n++] = (uint8_t)s.read(); last = millis(); }
+    if (n >= 5 && millis() - last >= gap) break;
+  }
+  if (n < 5) return false;
+  uint16_t got = (uint16_t)(buf[n-2] | ((uint16_t)buf[n-1] << 8));
+  if (mbCrc(buf, n - 2) != got) return false;
+  if (buf[0] != ppAddr[pi]) return false;
+  if (n >= 3 && (buf[1] & 0x80)) return false;   // 异常响应
+  return true;
+}
+
+// 发 06 写单寄存器；retries 次内有应答算成功
+bool ppWriteReg(uint8_t pi, uint16_t reg, uint16_t val, bool verbose = true, uint8_t retries = MB_RETRIES) {
+  uint8_t b[8];
+  b[0] = ppAddr[pi]; b[1] = 0x06;
+  b[2] = (uint8_t)(reg >> 8); b[3] = (uint8_t)(reg & 0xFF);
+  b[4] = (uint8_t)(val >> 8); b[5] = (uint8_t)(val & 0xFF);
+  uint16_t c = mbCrc(b, 6);
+  b[6] = (uint8_t)(c & 0xFF); b[7] = (uint8_t)(c >> 8);
+  for (uint8_t a = 0; a < retries; a++) {
+    HardwareSerial &s = *ppSer[pi];
+    while (s.available()) s.read();
+    ppDirLine(pi, true); delayMicroseconds(50);
+    s.write(b, 8); s.flush(); delayMicroseconds(120);
+    ppDirLine(pi, false);
+    if (verbose) { Serial.print(F("TX ")); mbHex(b, 8); Serial.println(); }
+    if (mbGetResp(pi, MB_RESP_TIMEOUT_MS)) { mbFails[pi] = 0; return true; }
+  }
+  mbFails[pi]++;
+  if (verbose) Serial.println(F("RX 无应答"));
+  return false;
+}
+
+#define REG_SPEED 0x0064
+#define REG_DIR   0x0065
+#define REG_CIRC  0x0066
+#define REG_CTRL  0x0068
+#define DIR_CCW   0x0001   // 逆时针=正常出液方向
+#define DIR_CW    0x0000
+#define CTRL_GO   0x0001
+#define CTRL_BACK 0x0002
+#define CTRL_STOP 0x0000
+
+bool ppSetDir(uint8_t pi, uint16_t d) { return ppWriteReg(pi, REG_DIR, d); }
+bool ppSetSpeed(uint8_t pi, uint16_t rpm) { return ppWriteReg(pi, REG_SPEED, rpm); }
+bool ppGo(uint8_t pi)   { return ppWriteReg(pi, REG_CTRL, CTRL_GO); }
+bool ppStop(uint8_t pi) { return ppWriteReg(pi, REG_CTRL, CTRL_STOP); }
+bool ppBack(uint8_t pi) { return ppWriteReg(pi, REG_CTRL, CTRL_BACK); }
+void ppStopQuiet(uint8_t pi) {        // 急停用：不打印、只发一次
+  uint8_t b[8];
+  b[0]=ppAddr[pi]; b[1]=0x06; b[2]=0x00; b[3]=REG_CTRL; b[4]=0; b[5]=0;
+  uint16_t c=mbCrc(b,6); b[6]=(uint8_t)c; b[7]=(uint8_t)(c>>8);
+  HardwareSerial &s=*ppSer[pi];
+  ppDirLine(pi,true); delayMicroseconds(50);
+  s.write(b,8); s.flush(); delayMicroseconds(120);
+  ppDirLine(pi,false);
+}
+
+/* ---------------- 调试用：SCAN 找波特率(只扫 PP1) ---------------- */
+void mbScan() {
+  const unsigned long rates[] = {1200,2400,4800,9600,19200,38400,57600,115200};
+  unsigned long saved = mbBaud;
+  for (uint8_t i = 0; i < 8; i++) {
+    mbBaud = rates[i]; ppBegin(0);
+    Serial.print(F("试 ")); Serial.print(mbBaud); Serial.print(F(" ... "));
+    uint8_t b[8] = {ppAddr[0],0x06,0x00,REG_CTRL,0x00,0x00,0,0};
+    uint16_t c=mbCrc(b,6); b[6]=c&0xFF; b[7]=c>>8;
+    HardwareSerial &s=*ppSer[0];
+    ppDirLine(0,true); delayMicroseconds(50);
+    s.write(b,8); s.flush(); delayMicroseconds(120);
+    ppDirLine(0,false);
+    Serial.println(mbGetResp(0, 120) ? F("有应答 <<<") : F("无应答"));
+  }
+  mbBaud = saved; ppBegin(0);
+  Serial.print(F("扫描结束，恢复 ")); Serial.println(mbBaud);
+}
+
+/* ---------------- 调试用：BRIDGE 透传，+++ 退出 ---------------- */
+int bridgePlus = 0;
+void serviceBridge() {
+  HardwareSerial &s = *ppSer[0];
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '+') { if (++bridgePlus >= 3) { bridgeMode=false; bridgePlus=0; ppDirLine(0,false); Serial.println(F("退出BRIDGE")); return; } }
+    else bridgePlus = 0;
+    ppDirLine(0,true);
+    s.write((uint8_t)c);
+    s.flush(); delayMicroseconds(120); ppDirLine(0,false);
+  }
+  while (s.available()) Serial.write((uint8_t)s.read());
+}
+
+/* ========================================================================
+   ⑨ 出液控制
+   ======================================================================== */
+void enterFault(const char* why) {
+  allStop(why);
+  machState = ST_FAULT;
+  stateT0 = millis();
+  Serial.print(F("!! 故障：")); Serial.println(why);
+  Serial.println(F("!! 处理后发 r 复位"));
+}
+
+// 制冰机接口：制冰机到了只改这个函数，配方表/点单格式都不用动
+void doIce(uint8_t sku, uint8_t cup, uint8_t sugar, uint8_t ice) {
+  (void)sku; (void)cup; (void)sugar; (void)ice;
+  // TODO(制冰机): ice==1 时在这里驱动制冰机
+}
+
+bool beginFill() {
+  Recipe &r = cfg.recipe[ordSku][ordCup][ordSugar][ordIce];
+  memset(&fc, 0, sizeof(fc));
+  float sum = 0; bool any = false;
+  bool allCalibrated = true;
+
+  // 检查配方是否引用了未安装的泵
+  for (int i = 0; i < DP_MAX; i++) {
+    if (r.dp[i] > 0 && !dpInstalled[i]) { Serial.println(F("配方引用了未安装的隔膜泵，拒绝出单")); return false; }
+    if (r.pp[i] > 0 && !ppInstalled[i]) { Serial.println(F("配方引用了未安装的蠕动泵，拒绝出单")); return false; }
+  }
+
+  unsigned long now = millis();
+  unsigned long tDp = now;
+  unsigned long tPp = now + DEFA_START_GAP_MS;
+
+  for (int i = 0; i < DP_MAX; i++) {
+    if (r.dp[i] > 0) {
+      fc.dTgt[i] = r.dp[i]; fc.dT0[i] = tDp; sum += r.dp[i]; any = true;
+      if (cfg.gpsDp[i] <= 0) allCalibrated = false;
+    }
+  }
+  for (int i = 0; i < PP_MAX; i++) {
+    if (r.pp[i] > 0) {
+      fc.pTgt[i] = r.pp[i]; fc.pT0[i] = tPp; sum += r.pp[i]; any = true;
+      if (cfg.gpsPp[i] <= 0) allCalibrated = false;
+    }
+  }
+  if (!any) { Serial.println(F("该组合配方为空(未上架/大杯加冰待补数据)，拒绝出单")); return false; }
+
+  fc.active = true;
+  fc.modeA = allCalibrated;
+  fc.totalTgt = sum;
+  fc.firstStart = now;
+  fc.flowRefW = 0; fc.flowRefT = now;
+  machState = ST_FILL;
+  stateT0 = now;
+
+  Serial.print(F("开始出液 总目标=")); Serial.print(sum, 1); Serial.print(F("g  模式="));
+  Serial.println(fc.modeA ? F("A(g/s分泵+秤兜底)") : F("B(未标定,总重到量一起停)"));
+  doIce(ordSku, ordCup, ordSugar, ordIce);
+  return true;
+}
+
+void stopDp(uint8_t i, const char* why) {
+  if (!fc.dRun[i]) return;
+  dpWrite(i, false);
+  fc.dRun[i] = false;
+  Serial.print(F("[DP")); Serial.print(i+1); Serial.print(F("] 停 (")); Serial.print(why);
+  Serial.print(F(") 估算/目标: "));
+  float est = (millis() - fc.dT0[i]) / 1000.0f * cfg.gpsDp[i];
+  Serial.print(est, 1); Serial.print('/'); Serial.println(fc.dTgt[i], 1);
+}
+
+void stopPp(uint8_t i, const char* why) {
+  if (!fc.pRun[i]) return;
+  ppStop(i);
+  fc.pRun[i] = false;
+  Serial.print(F("[PP")); Serial.print(i+1); Serial.print(F("] 停 (")); Serial.print(why);
+  Serial.print(F(") 估算/目标: "));
+  float est = (millis() - fc.pT0[i]) / 1000.0f * cfg.gpsPp[i];
+  Serial.print(est, 1); Serial.print('/'); Serial.println(fc.pTgt[i], 1);
+  // 自动回吸
+  if (cfg.suckMs > 0) {
+    if (ppBack(i)) { fc.pSuck[i] = true; fc.pSuckEnd[i] = millis() + cfg.suckMs; }
+  }
+}
+
+void stopAllPumps(const char* why) {
+  for (int i = 0; i < DP_MAX; i++) if (fc.dRun[i]) { dpWrite(i,false); fc.dRun[i]=false; }
+  for (int i = 0; i < PP_MAX; i++) {
+    if (fc.pRun[i]) {
+      ppStop(i); fc.pRun[i]=false;
+      if (cfg.suckMs > 0 && ppBack(i)) { fc.pSuck[i]=true; fc.pSuckEnd[i]=millis()+cfg.suckMs; }
+    }
+  }
+  Serial.print(F("[出液] 全部泵停 (")); Serial.print(why); Serial.println(')');
+}
+
+bool anyPumpBusy() {
+  for (int i=0;i<DP_MAX;i++) if (fc.dRun[i]) return true;
+  for (int i=0;i<PP_MAX;i++) if (fc.pRun[i] || fc.pSuck[i]) return true;
+  return false;
+}
+
+void serviceFill() {
+  unsigned long now = millis();
+  float w = hxLastW;
+
+  // ---- 启动(错峰150ms) ----
+  for (int i = 0; i < DP_MAX; i++) {
+    if (fc.dTgt[i] > 0 && !fc.dStarted[i] && now >= fc.dT0[i]) {
+      fc.dStarted[i] = true;
+      dpWrite(i, true);
+      fc.dRun[i] = true;
+      Serial.print(F("[DP")); Serial.print(i+1); Serial.println(F("] 启动"));
+    }
+  }
+  for (int i = 0; i < PP_MAX; i++) {
+    if (fc.pTgt[i] > 0 && !fc.pStarted[i] && now >= fc.pT0[i]) {
+      fc.pStarted[i] = true;
+      bool ok = ppSetDir(i, DIR_CCW) && ppSetSpeed(i, cfg.ppSpeed) && ppGo(i);
+      if (!ok) { enterFault("蠕动泵启动无应答(3次)"); return; }
+      fc.pRun[i] = true;
+      Serial.print(F("[PP")); Serial.print(i+1); Serial.println(F("] 启动"));
+    }
+  }
+
+  // ---- 回吸结束发 STOP ----
+  for (int i = 0; i < PP_MAX; i++) {
+    if (fc.pSuck[i] && now >= fc.pSuckEnd[i]) {
+      fc.pSuck[i] = false;
+      ppStop(i);
+      Serial.print(F("[PP")); Serial.print(i+1); Serial.println(F("] 回吸结束"));
+    }
+  }
+
+  // ---- 出液中取杯(去皮后取杯 -> 读数约为负杯重) ----
+  if (w < -8.0f) { enterFault("出液中杯子被取走"); return; }
+
+  // ---- 模式A：按 g/s 估算分泵到量停 ----
+  if (fc.modeA) {
+    for (int i = 0; i < DP_MAX; i++) {
+      if (fc.dRun[i]) {
+        float est = (now - fc.dT0[i]) / 1000.0f * cfg.gpsDp[i];
+        if (est >= fc.dTgt[i] - cfg.preDp[i]) stopDp(i, "估算到量");
+      }
+    }
+    for (int i = 0; i < PP_MAX; i++) {
+      if (fc.pRun[i]) {
+        float est = (now - fc.pT0[i]) / 1000.0f * cfg.gpsPp[i];
+        if (est >= fc.pTgt[i] - cfg.prePp[i]) stopPp(i, "估算到量");
+      }
+    }
+  }
+
+  // ---- 秤兜底：总重到量 ----
+  if (w >= fc.totalTgt - (fc.modeA ? 0.0f : 2.0f)) {
+    stopAllPumps("秤总重到配方总和");
+  }
+  // ---- 溢出故障 ----
+  if (w > fc.totalTgt + DEFA_OVERFILL_G) { enterFault("总重超限(溢出风险)"); return; }
+
+  // ---- 空转/堵管：每8s窗口总重增量 < 8g ----
+  if (now - fc.flowRefT >= cfg.noflowMs) {
+    if (w - fc.flowRefW < cfg.noflowG) { enterFault("8秒几乎无进液(空转/堵管/缺料)"); return; }
+    fc.flowRefW = w; fc.flowRefT = now;
+  }
+
+  // ---- 单泵超时 ----
+  for (int i=0;i<DP_MAX;i++) if (fc.dRun[i] && now-fc.dT0[i] > cfg.pumpTimeoutMs) { enterFault("隔膜泵运行超时"); return; }
+  for (int i=0;i<PP_MAX;i++) if (fc.pRun[i] && now-fc.pT0[i] > cfg.pumpTimeoutMs) { enterFault("蠕动泵运行超时"); return; }
+
+  // ---- 全部停(含回吸结束) -> 判稳 ----
+  if (!anyPumpBusy() && fc.active) {
+    fc.active = false;
+    machState = ST_SETTLE;
+    stateT0 = settleT0 = millis();
+    lastWChangeMs = millis();
+    Serial.print(F("出液完成，判稳中... 当前=")); Serial.print(w,1);
+    Serial.print(F("g 目标=")); Serial.print(fc.totalTgt,1);
+    Serial.print(F("g 偏差=")); Serial.print(w - fc.totalTgt, 1); Serial.println('g');
+  }
+}
+
+/* ========================================================================
+   ⑩ 主机状态机
+   ======================================================================== */
+void gotoIdle(const char* why) {
+  machState = ST_IDLE;
+  stateT0 = millis();
+  if (why) { Serial.print(F("回待机: ")); Serial.println(why); }
+  if (debugWanted) {
+    debugWanted = false; debugMode = true;
+    Serial.println(F("====== 当前杯已做完，进入调试模式 (RUN 退出) ======"));
+  }
+}
+
+void serviceMachine() {
+  unsigned long now = millis();
+  float w = hxLastW;
+
+  switch (machState) {
+    case ST_IDLE:
+      // 急停后等杯子真正取走(读数掉到负杯重)再去皮，防止带杯清零
+      if (pendingEmptyTare && w < -8.0f) {
+        pendingEmptyTare = false;
+        hxTare();
+        Serial.println(F("杯子已取走，空秤自动去皮完成"));
+      }
+      break;
+
+    case ST_WAIT_CUP: {
+      if (now - stateT0 >= cfg.cupWaitMs) { gotoIdle("等杯超时，订单作废"); break; }
+      if (!cupConfirmed) {
+        if (w < cfg.cupTrigG - 1.0f) {                       // 释放阈值13g，带回差
+          cupSeenT = 0;
+        } else if (w >= cfg.cupTrigG - 0.5f) {               // 触发阈值留0.5g量化余量
+          if (cupSeenT == 0) { cupSeenT = now; cupMinW = cupMaxW = w; }
+          if (w < cupMinW) cupMinW = w;
+          if (w > cupMaxW) cupMaxW = w;
+          // 窗口内波动超限 -> 窗口重新计时(手一直压着就一直确认不了)
+          if (cupMaxW - cupMinW > DEFA_CUP_STABLE_G) { cupSeenT = now; cupMinW = cupMaxW = w; }
+          if (now - cupSeenT >= cfg.cupConfirmMs) {
+            cupConfirmed = true;
+            Serial.println(F("放杯确认，去皮中..."));
+            hxTare();
+            if (!beginFill()) { cupSeenT=0; cupConfirmed=false; gotoIdle("无法开单"); }
+          }
+        }
+      }
+      break;
+    }
+
+    case ST_FILL:
+      serviceFill();
+      break;
+
+    case ST_SETTLE:
+      if (now - settleT0 >= DEFA_STABLE_TIMEOUT) {
+        Serial.println(F("判稳超时，按当前重量继续"));
+        machState = ST_WAIT_MOVE; stateT0 = now;
+      } else if (hxStable(DEFA_STABLE_G, DEFA_STABLE_MS)) {
+        Serial.print(F("判稳完成 净重=")); Serial.println(hxLastW, 1);
+        machState = ST_WAIT_MOVE; stateT0 = now;
+      }
+      break;
+
+    case ST_WAIT_MOVE:
+      if (now - stateT0 >= cfg.moveWaitMs) {
+        Serial.println(F("等待结束，气缸点动"));
+        valvePulse(cfg.valvePulseMs);
+        machState = ST_VALVE; stateT0 = now;
+      }
+      break;
+
+    case ST_VALVE:
+      if (!valveOn) {
+        Serial.println(F("压盖完成，取杯后自动去皮"));
+        machState = ST_FINISH; stateT0 = now;
+      }
+      break;
+
+    case ST_FINISH:
+      // 去皮基准是"带杯=0"，取走后读数约为负杯重(<-8g)
+      if (w < -8.0f) {
+        hxTare();
+        Serial.println(F("已取杯，去皮完成"));
+        gotoIdle("一杯完成");
+      }
+      break;
+
+    case ST_FAULT:
+      break;
+  }
+}
+
+/* ========================================================================
+   ⑪ CALF 自动流量标定 (调试模式)
+   ======================================================================== */
+void calfStart(uint8_t kind, uint8_t idx, float seconds) {
+  if (calf.active) { Serial.println(F("标定进行中，发 r 取消")); return; }
+  if (hxLastW > DEFA_CALF_MAX_G) { Serial.println(F("秤上重量过大，拒绝标定(先放空杯)")); return; }
+  if (seconds <= 0 || seconds > 30) { Serial.println(F("标定秒数范围 1~30")); return; }
+  memset(&calf, 0, sizeof(calf));
+  calf.active = true; calf.kind = kind; calf.idx = idx; calf.seconds = seconds;
+  calf.w0 = hxLastW; calf.t0 = millis(); calf.step = 1;
+  if (kind == 0) { dpWrite(idx, true); Serial.print(F("[DP")); Serial.print(idx+1); Serial.println(F("] 标定启动")); }
+  else {
+    if (!(ppSetDir(idx, DIR_CCW) && ppSetSpeed(idx, cfg.ppSpeed) && ppGo(idx))) {
+      calf.active = false; Serial.println(F("蠕动泵无应答，标定中止")); return;
+    }
+    Serial.print(F("[PP")); Serial.print(idx+1); Serial.println(F("] 标定启动"));
+  }
+}
+void serviceCalf() {
+  if (!calf.active) return;
+  unsigned long now = millis();
+  if (hxLastW > DEFA_CALF_MAX_G) {
+    if (calf.kind==0) dpWrite(calf.idx,false); else ppStop(calf.idx);
+    calf.active=false; Serial.println(F("标定中止：超过450g")); return;
+  }
+  if (calf.step == 1 && now - calf.t0 >= (unsigned long)(calf.seconds*1000)) {
+    if (calf.kind==0) dpWrite(calf.idx,false); else ppStop(calf.idx);
+    calf.step = 2; calf.t0 = now; lastWChangeMs = now;
+    Serial.println(F("泵停，等余液滴落..."));
+  } else if (calf.step == 2) {
+    if (hxStable(1.0f, 600) || now - calf.t0 > 3000) {
+      float delta = hxLastW - calf.w0;
+      float gps = delta / calf.seconds;
+      if (delta <= 0.5f) { Serial.println(F("增量过小，标定失败(查泵/管路/方向)")); }
+      else {
+        if (calf.kind==0) cfg.gpsDp[calf.idx]=gps; else cfg.gpsPp[calf.idx]=gps;
+        Serial.print(F("增量=")); Serial.print(delta,1); Serial.print(F("g  流量="));
+        Serial.print(gps,2); Serial.println(F(" g/s (RUN后存盘)"));
+      }
+      calf.active=false;
+    }
+  }
+}
+
+/* ========================================================================
+   ⑫ 串口命令
+   ======================================================================== */
+char* argv[16];
+int   argc = 0;
+void tokenize(char* s) {
+  argc = 0;
+  for (char* p = s; *p; p++) *p = toupper((unsigned char)*p);
+  char* t = strtok(s, " ");
+  while (t && argc < 16) { argv[argc++] = t; t = strtok(NULL, " "); }
+}
+bool isInt(const char* s) {
+  if (!s || !*s) return false;
+  if (*s=='-') s++;
+  if (!*s) return false;
+  for (; *s; s++) if (!isdigit((unsigned char)*s)) return false;
+  return true;
+}
+bool isNum(const char* s) {
+  if (!s || !*s) return false;
+  bool dot=false;
+  if (*s=='-') s++;
+  if (!*s) return false;
+  for (; *s; s++) {
+    if (*s=='.' && !dot) { dot=true; continue; }
+    if (!isdigit((unsigned char)*s)) return false;
+  }
+  return true;
+}
+// 解析 "DPn"/"PPn"，成功返回true并给出 kind(0=DP,1=PP) 与索引
+bool parsePump(const char* s, uint8_t &kind, uint8_t &idx) {
+  if (s[0]=='D' && s[1]=='P' && isdigit((unsigned char)s[2]) && s[3]==0) { kind=0; idx=s[2]-'1'; return idx<DP_MAX; }
+  if (s[0]=='P' && s[1]=='P' && isdigit((unsigned char)s[2]) && s[3]==0) { kind=1; idx=s[2]-'1'; return idx<PP_MAX; }
+  return false;
+}
+
+void printHelp() {
+  Serial.println(F("===== 命令表 ====="));
+  Serial.println(F("[正常] 1 1 0 0        下单: SKU 杯型(0中1大) 糖(0少1正常2多) 冰(0去1加)"));
+  Serial.println(F("       DEBUG / RUN    进入调试 / 存EEPROM回正常"));
+  Serial.println(F("       r             急停(泵+气缸+485)"));
+  Serial.println(F("       S / HELP      状态 / 命令表"));
+  Serial.println(F("[调试] DP1 ON|OFF|T 秒        隔膜泵手动"));
+  Serial.println(F("       PP1 GO|STOP|BACK|SPEED n|DIR CW|CCW"));
+  Serial.println(F("       VALVE ON|OFF|T         气缸伸/缩/点动"));
+  Serial.println(F("       CALF DP1 3 / CALF PP1 5  自动标定流量g/s"));
+  Serial.println(F("       FLOWS / FLOW PP1 2.8   查看/手填流量"));
+  Serial.println(F("       TARE / CAL 200.0 / RAW 去皮/校准/原始值(再发一次停)"));
+  Serial.println(F("       RCP 1 1 0 0 [PP1 15 ...] 打印或改配方"));
+  Serial.println(F("       SET WAITCUP|MOVE|VALVE|SUCK 数值"));
+  Serial.println(F("       SET TRIG 14 / SET NOFLOW 8000 8"));
+  Serial.println(F("       RESETCFG       配方参数恢复出厂(不动校准值)"));
+  Serial.println(F("       SCAN / BRIDGE / PARITY N|E|O / BAUD 115200 / STATUS"));
+  Serial.println(F("=================="));
+}
+
+void printStatus() {
+  Serial.print(F("模式=")); Serial.print(debugMode?F("DEBUG"):F("RUN"));
+  Serial.print(F(" 状态=")); Serial.print(stateName(machState));
+  Serial.print(F(" 重量=")); Serial.print(hxLastW, 1); Serial.print('g');
+  if (machState==ST_FILL) {
+    Serial.print(F(" | 总目标=")); Serial.print(fc.totalTgt,1);
+    for (int i=0;i<DP_MAX;i++) if (fc.dTgt[i]>0) {
+      Serial.print(F(" DP")); Serial.print(i+1); Serial.print(fc.dRun[i]?F(":转"):F(":停"));
+      if (fc.modeA) { Serial.print(F("估")); Serial.print((millis()-fc.dT0[i])/1000.0f*cfg.gpsDp[i],0); }
+    }
+    for (int i=0;i<PP_MAX;i++) if (fc.pTgt[i]>0) {
+      Serial.print(F(" PP")); Serial.print(i+1);
+      Serial.print(fc.pRun[i]?F(":转"):(fc.pSuck[i]?F(":回吸"):F(":停")));
+    }
+  }
+  Serial.println();
+}
+
+void printRecipe(uint8_t sku, uint8_t cup, uint8_t sugar, uint8_t ice) {
+  Recipe &r = cfg.recipe[sku][cup][sugar][ice];
+  Serial.print(F("SKU")); Serial.print(sku+1);
+  Serial.print(cup?F(" 大杯"):F(" 中杯"));
+  Serial.print(sugar==0?F(" 少糖"):sugar==1?F(" 正常糖"):F(" 多糖"));
+  Serial.print(ice?F(" 加冰:"):F(" 去冰:"));
+  bool any=false;
+  for (int i=0;i<DP_MAX;i++) if (r.dp[i]>0) { Serial.print(F(" DP")); Serial.print(i+1); Serial.print('='); Serial.print(r.dp[i],1); any=true; }
+  for (int i=0;i<PP_MAX;i++) if (r.pp[i]>0) { Serial.print(F(" PP")); Serial.print(i+1); Serial.print('='); Serial.print(r.pp[i],1); any=true; }
+  if (!any) Serial.print(F(" (空配方)"));
+  Serial.println();
+}
+
+// 调试模式下 DP 手动定时(独立于自动出液)
+unsigned long dbgDpOffAt[DP_MAX] = {0};
+bool dbgDpTimed[DP_MAX] = {false};
+
+/* ---------------- 调试命令处理 ---------------- */
+void cmdDebug() {
+  // 手动泵
+  uint8_t kind, idx;
+  if (argc >= 2 && parsePump(argv[0], kind, idx)) {
+    bool installed = kind==0 ? dpInstalled[idx] : ppInstalled[idx];
+    if (!installed) { Serial.println(F("该泵未安装")); return; }
+    const char* act = argv[1];
+    if (kind==0) {
+      if (!strcmp(act,"ON")) { dpWrite(idx,true); dbgDpTimed[idx]=false; Serial.println(F("DP ON")); }
+      else if (!strcmp(act,"OFF")) { dpWrite(idx,false); dbgDpTimed[idx]=false; Serial.println(F("DP OFF")); }
+      else if (!strcmp(act,"T") && argc>=3 && isNum(argv[2])) {
+        dpWrite(idx,true);
+        dbgDpTimed[idx]=true;
+        dbgDpOffAt[idx]=millis()+(unsigned long)(atof(argv[2])*1000);
+        Serial.print(F("DP 定时 ")); Serial.print(atof(argv[2]),1); Serial.println(F("s"));
+      } else Serial.println(F("用法: DP1 ON|OFF|T 秒"));
+    } else {
+      if (!strcmp(act,"GO"))   { if(ppSetDir(idx,DIR_CCW)&&ppSetSpeed(idx,cfg.ppSpeed)&&ppGo(idx)) Serial.println(F("PP GO")); }
+      else if (!strcmp(act,"STOP")) { ppStop(idx); }
+      else if (!strcmp(act,"BACK")) { ppBack(idx); Serial.println(F("持续回吸中，发 PP1 STOP 停止")); }
+      else if (!strcmp(act,"SPEED") && argc>=3 && isInt(argv[2])) {
+        cfg.ppSpeed=(uint16_t)atol(argv[2]); ppSetSpeed(idx,cfg.ppSpeed);
+        Serial.print(F("转速(0.01rpm)=")); Serial.println(cfg.ppSpeed);
+      }
+      else if (!strcmp(act,"DIR") && argc>=3) {
+        if (!strcmp(argv[2],"CCW")) ppSetDir(idx,DIR_CCW);
+        else if (!strcmp(argv[2],"CW")) ppSetDir(idx,DIR_CW);
+        else Serial.println(F("DIR CW|CCW"));
+      } else Serial.println(F("用法: PP1 GO|STOP|BACK|SPEED n|DIR CW|CCW"));
+    }
+    return;
+  }
+
+  if (!strcmp(argv[0],"VALVE")) {
+    if (argc>=2 && !strcmp(argv[1],"ON")) { valveWrite(true); valveOffAt=0; }
+    else if (argc>=2 && !strcmp(argv[1],"OFF")) { valveWrite(false); valveOffAt=0; }
+    else if (argc>=2 && !strcmp(argv[1],"T")) { valvePulse(cfg.valvePulseMs); }
+    else { Serial.println(F("VALVE ON|OFF|T")); }
+    return;
+  }
+
+  if (!strcmp(argv[0],"CALF")) {
+    if (argc>=3 && parsePump(argv[1],kind,idx)) {
+      bool installed = kind==0 ? dpInstalled[idx] : ppInstalled[idx];
+      if (installed) calfStart(kind, idx, argc>=4 ? (float)atof(argv[3]) : (kind==0?3.0f:5.0f));
+      else Serial.println(F("该泵未安装"));
+    } else Serial.println(F("用法: CALF DP1 3 / CALF PP1 5"));
+    return;
+  }
+
+  if (!strcmp(argv[0],"FLOWS")) {
+    for (int i=0;i<DP_MAX;i++) if (dpInstalled[i]) { Serial.print(F("DP")); Serial.print(i+1); Serial.print(F(" = ")); Serial.print(cfg.gpsDp[i],3); Serial.println(F(" g/s")); }
+    for (int i=0;i<PP_MAX;i++) if (ppInstalled[i]) { Serial.print(F("PP")); Serial.print(i+1); Serial.print(F(" = ")); Serial.print(cfg.gpsPp[i],3); Serial.println(F(" g/s")); }
+    return;
+  }
+  if (!strcmp(argv[0],"FLOW")) {
+    if (argc>=3 && parsePump(argv[1],kind,idx) && isNum(argv[2])) {
+      float v=(float)atof(argv[2]);
+      if (kind==0) cfg.gpsDp[idx]=v; else cfg.gpsPp[idx]=v;
+      Serial.print(F("已设 ")); Serial.print(argv[1]); Serial.print(F(" = ")); Serial.print(v,3); Serial.println(F(" g/s (RUN存盘)"));
+    } else Serial.println(F("用法: FLOW PP1 2.8"));
+    return;
+  }
+
+  if (!strcmp(argv[0],"TARE")) { if(hxTare()) Serial.println(F("去皮完成")); else Serial.println(F("去皮失败:读不到秤")); return; }
+  if (!strcmp(argv[0],"CAL")) {
+    if (argc>=2 && isNum(argv[1])) {
+      // 先 TARE 空秤，再放砝码发 CAL 克数
+      long raw; int n=0; long sum=0; unsigned long t0=millis();
+      while(n<8 && millis()-t0<1500){ if(hxReadRaw(raw)){sum+=raw;n++;} }
+      if(n<4){ Serial.println(F("读不到秤")); return; }
+      long avg=sum/n; long net=avg-hxOffset;
+      float known=(float)atof(argv[1]);
+      if (known<=0 || net<=0){ Serial.println(F("校准失败:确认已先TARE且已放砝码")); return; }
+      calFactor=(float)net/known;
+      saveCal();
+      Serial.print(F("校准系数=")); Serial.print(calFactor,3); Serial.println(F(" 已存EEPROM"));
+    } else Serial.println(F("用法: 先TARE(空秤)->放砝码->CAL 200.0"));
+    return;
+  }
+  if (!strcmp(argv[0],"RAW")) {
+    rawStream=!rawStream;
+    Serial.println(rawStream?F("原始值流 开(再发RAW停)"):F("原始值流 关"));
+    return;
+  }
+
+  if (!strcmp(argv[0],"RCP")) {
+    if (argc>=4 && isInt(argv[1]) && isInt(argv[2]) && isInt(argv[3])) {
+      int sku=atoi(argv[1])-1, cup=atoi(argv[2]), sug=atoi(argv[3]);
+      if (sku<0||sku>=SKU_MAX||cup<0||cup>=CUP_N||sug<0||sug>=SUGAR_N) { Serial.println(F("范围: SKU1-5 杯0-1 糖0-2")); return; }
+      // 第4位是冰(0/1)就吃掉；否则视为泵对开始(兼容不带冰的旧写法)
+      int ice=0; int pairBase=4;
+      if (argc>=5 && (argv[4][0]=='0'||argv[4][0]=='1') && argv[4][1]==0) { ice=argv[4][0]-'0'; pairBase=5; }
+      for (int i=pairBase; i+1<argc; i+=2) {
+        uint8_t k,ix;
+        if (parsePump(argv[i],k,ix) && isNum(argv[i+1])) {
+          if(k==0) cfg.recipe[sku][cup][sug][ice].dp[ix]=(float)atof(argv[i+1]);
+          else     cfg.recipe[sku][cup][sug][ice].pp[ix]=(float)atof(argv[i+1]);
+        }
+      }
+      printRecipe(sku,cup,sug,ice);
+      Serial.println(F("(RUN后存盘)"));
+    } else Serial.println(F("用法: RCP 1 1 0 0 PP1 15 DP1 500 ；不带泵对=打印该行"));
+    return;
+  }
+
+  if (!strcmp(argv[0],"SET")) {
+    if (argc>=3 && !strcmp(argv[1],"WAITCUP") && isInt(argv[2])) cfg.cupWaitMs=atol(argv[2]);
+    else if (argc>=3 && !strcmp(argv[1],"MOVE") && isInt(argv[2])) cfg.moveWaitMs=atol(argv[2]);
+    else if (argc>=3 && !strcmp(argv[1],"VALVE") && isInt(argv[2])) cfg.valvePulseMs=atol(argv[2]);
+    else if (argc>=3 && !strcmp(argv[1],"SUCK") && isInt(argv[2])) cfg.suckMs=atol(argv[2]);
+    else if (argc>=3 && !strcmp(argv[1],"TRIG") && isNum(argv[2])) cfg.cupTrigG=(float)atof(argv[2]);
+    else if (argc>=4 && !strcmp(argv[1],"NOFLOW") && isInt(argv[2]) && isNum(argv[3])) { cfg.noflowMs=atol(argv[2]); cfg.noflowG=(float)atof(argv[3]); }
+    else { Serial.println(F("SET WAITCUP|MOVE|VALVE|SUCK 毫秒 / TRIG 克 / NOFLOW 毫秒 克")); return; }
+    Serial.println(F("参数已改(RUN存盘)"));
+    return;
+  }
+
+  if (!strcmp(argv[0],"RESETCFG")) {
+    setDefaultConfig(); saveConfig();
+    Serial.println(F("配方与参数已恢复出厂(校准值保留)"));
+    return;
+  }
+
+  if (!strcmp(argv[0],"SCAN")) { mbScan(); return; }
+  if (!strcmp(argv[0],"BRIDGE")) { bridgeMode=true; bridgePlus=0; Serial.println(F("进入BRIDGE，发+++退出")); return; }
+  if (!strcmp(argv[0],"PARITY")) {
+    if (argc>=2) {
+      mbParity = !strcmp(argv[1],"E")?1:!strcmp(argv[1],"O")?2:0;
+      for (int i=0;i<PP_MAX;i++) if(ppInstalled[i]) ppBegin(i);
+      Serial.println(F("校验位已改(断电恢复8N1)"));
+    } else Serial.println(F("PARITY N|E|O"));
+    return;
+  }
+  if (!strcmp(argv[0],"BAUD")) {
+    if (argc>=2 && isInt(argv[1])) {
+      mbBaud=atol(argv[1]);
+      for (int i=0;i<PP_MAX;i++) if(ppInstalled[i]) ppBegin(i);
+      Serial.print(F("波特率=")); Serial.println(mbBaud);
+    } else Serial.println(F("BAUD 115200"));
+    return;
+  }
+  if (!strcmp(argv[0],"STATUS")) {
+    Serial.print(F("PP1 从站=0x")); Serial.print(ppAddr[0],HEX);
+    Serial.print(F(" 波特率=")); Serial.print(mbBaud);
+    Serial.print(mbParity==0?F(" 8N1"):mbParity==1?F(" 8E1"):F(" 8O1"));
+    Serial.print(F(" 转速=")); Serial.print(cfg.ppSpeed);
+    Serial.print(F(" 失败计数=")); Serial.println(mbFails[0]);
+    Serial.print(F("时间: 等杯=")); Serial.print(cfg.cupWaitMs/1000);
+    Serial.print(F("s 移杯=")); Serial.print(cfg.moveWaitMs/1000);
+    Serial.print(F("s 点动=")); Serial.print(cfg.valvePulseMs);
+    Serial.print(F("ms 回吸=")); Serial.print(cfg.suckMs); Serial.println(F("ms"));
+    Serial.print(F("校准系数=")); Serial.println(calFactor,3);
+    return;
+  }
+
+  Serial.println(F("未知调试命令，发 HELP"));
+}
+
+void serviceDbgTimers() {
+  if (!debugMode) return;
+  for (int i=0;i<DP_MAX;i++) {
+    if (dbgDpTimed[i] && millis()>=dbgDpOffAt[i]) {
+      dbgDpTimed[i]=false;
+      if (!fc.dRun[i]) dpWrite(i,false);
+      Serial.print(F("[DP")); Serial.print(i+1); Serial.println(F("] 手动定时到"));
+    }
+  }
+}
+
+void processCmd(char* raw) {
+  tokenize(raw);
+  if (argc == 0) return;
+
+  // ---- 两个模式通用 ----
+  if (!strcmp(argv[0],"HELP") || !strcmp(argv[0],"?")) { printHelp(); return; }
+  if (!strcmp(argv[0],"S")) { printStatus(); return; }
+  if (!strcmp(argv[0],"R")) {        // 输入会被统一转大写，r/R 都走这里
+    allStop("手动急停");
+    for (int i=0;i<DP_MAX;i++){dbgDpTimed[i]=false;}
+    cupSeenT=0; cupConfirmed=false;
+    if (debugMode) { Serial.println(F("调试模式下急停完成")); }
+    else {
+      machState=ST_IDLE; stateT0=millis();
+      pendingEmptyTare=true;       // 取走杯子后自动去皮，避免下一杯阈值失效
+      Serial.println(F("取走杯子后将自动去皮"));
+    }
+    debugWanted=false;
+    return;
+  }
+  if (!strcmp(argv[0],"DEBUG")) {
+    if (debugMode) { Serial.println(F("已在调试模式")); return; }
+    if (machState==ST_IDLE || machState==ST_FAULT) {
+      debugMode=true;
+      Serial.println(F("====== 进入调试模式 (自动流程已禁用, RUN 退出) ======"));
+    } else {
+      debugWanted=true;
+      Serial.println(F("当前有订单，做完手上这杯后自动进入调试，后续订单暂停"));
+    }
+    return;
+  }
+  if (!strcmp(argv[0],"RUN")) {
+    if (!debugMode) { Serial.println(F("当前不在调试模式")); return; }
+    if (hxLastW > 8.0f) { Serial.println(F("!! 秤上有杯，不能退出调试(取走杯子再发RUN)")); return; }
+    saveConfig();
+    debugMode=false;
+    hxTare();
+    machState=ST_IDLE; stateT0=millis();
+    Serial.println(F("====== 参数已存EEPROM，回到正常模式，待机中 ======"));
+    return;
+  }
+
+  // ---- 仅正常模式：下单(4个数字) ----
+  if (!debugMode && argc==4 && isInt(argv[0]) && isInt(argv[1]) && isInt(argv[2]) && isInt(argv[3])) {
+    int sku=atoi(argv[0])-1, cup=atoi(argv[1]), sug=atoi(argv[2]), ice=atoi(argv[3]);
+    if (sku<0||sku>=SKU_MAX){Serial.println(F("SKU 范围 1~5"));return;}
+    if (cup<0||cup>=CUP_N){Serial.println(F("杯型 0=中 1=大"));return;}
+    if (sug<0||sug>=SUGAR_N){Serial.println(F("糖度 0少 1正常 2多"));return;}
+    if (ice<0||ice>=ICE_N){Serial.println(F("冰 0去 1加"));return;}
+    if (machState!=ST_IDLE){Serial.println(F("当前忙，做完或发r后再下单"));return;}
+    ordSku=sku;ordCup=cup;ordSugar=sug;ordIce=ice;
+    printRecipe(sku,cup,sug,ice);
+    Recipe &r=cfg.recipe[sku][cup][sug][ice];
+    bool empty=true;
+    for(int i=0;i<DP_MAX;i++) if(r.dp[i]>0) empty=false;
+    for(int i=0;i<PP_MAX;i++) if(r.pp[i]>0) empty=false;
+    if(empty){Serial.println(F("该组合未上架(如大杯加冰待补数据)"));return;}
+    machState=ST_WAIT_CUP; stateT0=millis();
+    cupSeenT=0; cupConfirmed=false;
+    Serial.print(F("已接单，请在 ")); Serial.print(cfg.cupWaitMs/1000); Serial.println(F(" 秒内放空杯"));
+    return;
+  }
+  if (!debugMode && argc==4) { Serial.println(F("下单格式: 1 1 0 0 (SKU 杯 糖 冰)")); return; }
+
+  // ---- 仅调试模式的其它命令 ----
+  if (debugMode) { cmdDebug(); return; }
+
+  Serial.println(F("未知命令，发 HELP；改参数请先发 DEBUG"));
+}
+
+void handleSerial() {
+  while (Serial.available()) {
+    char c=(char)Serial.read();
+    if (c=='\n'||c=='\r') {
+      if (cmdLen>0) { cmdBuf[cmdLen]=0; processCmd(cmdBuf); cmdLen=0; }
+    } else if (cmdLen < (int)sizeof(cmdBuf)-1) cmdBuf[cmdLen++]=c;
+    lastCharMs=millis();
+  }
+  if (cmdLen>0 && millis()-lastCharMs>1000) cmdLen=0;
+}
+
+/* ========================================================================
+   ⑬ setup / loop
+   ======================================================================== */
+void setup() {
+  // 第一时间把所有继电器置于释放态，防上电抖动
+  for (int i=0;i<DP_MAX;i++) { pinMode(dpPin[i],OUTPUT); digitalWrite(dpPin[i],RELAY_OFF); }
+  pinMode(VALVE_PIN,OUTPUT); digitalWrite(VALVE_PIN,RELAY_OFF);
+  pinMode(HX_SCK,OUTPUT); digitalWrite(HX_SCK,LOW);
+  pinMode(HX_DT,INPUT);
+  for (int i=0;i<PP_MAX;i++) { pinMode(ppEnPin[i],OUTPUT); ppDirLine(i,false); }
+
+  Serial.begin(115200);
+  delay(300);
+
+  if (!loadConfig()) { setDefaultConfig(); saveConfig(); Serial.println(F("配置缺失/损坏，已写入出厂默认")); }
+  if (!loadCal()) { saveCal(); Serial.println(F("秤校准用默认系数，请用 CAL 重新校准")); }
+
+  for (int i=0;i<PP_MAX;i++) if (ppInstalled[i]) ppBegin(i);
+
+  Serial.println(F("=== 奶茶机器人 v1.0 启动 ==="));
+  Serial.print(F("D6=DP1茶汤 D7=气缸 D8=485EN 秤D2/D3 ; PP1="));
+  Serial.print(mbBaud); Serial.println(F(" 8N1 从站0x01"));
+  if (hxTare()) Serial.println(F("空秤去皮完成，待机。发 HELP 看命令表"));
+  else Serial.println(F("!! 开机去皮失败：检查HX711接线/供电(仍可发DEBUG->TARE重试)"));
+  printHelp();
+}
+
+void loop() {
+  hxPoll();
+  serviceValve();
+
+  if (bridgeMode) { serviceBridge(); return; }
+
+  if (!debugMode && machState!=ST_FAULT) serviceMachine();
+  if (machState==ST_FAULT) {
+    // 故障态只响应串口(r)，不自动动作
+  }
+  if (debugMode) { serviceCalf(); serviceDbgTimers(); }
+
+  // 周期状态
+  if (millis()-lastPrintMs >= (rawStream?500:1000)) {
+    lastPrintMs=millis();
+    if (rawStream) {
+      Serial.print(F("RAW=")); Serial.print(hxLastRaw);
+      Serial.print(F(" EMA=")); Serial.print(hxEma,0);
+      Serial.print(F(" OFF=")); Serial.print(hxOffset);
+      Serial.print(F(" CAL=")); Serial.print(calFactor,3);
+      Serial.print(F(" W=")); Serial.println(hxLastW,2);
+    }
+  }
+
+  handleSerial();
+}
+
+/* ========================================================================
+   ⑭ 以后扩展示例（不需要扩展时不用看）
+   ------------------------------------------------------------------------
+   【加一台隔膜泵 DP2】
+   1) 继电器 IN 接到 D4，把安装表改一行：
+        const uint8_t dpPin[DP_MAX] = { 6, 4, ... };
+        const bool dpInstalled[DP_MAX] = { true, TRUE_HERE, ... };
+   2) 继电器 VCC/GND 与功率地按之前方案处理。
+   3) 配方里给 DP2 克数：调试发 RCP 1 1 0 0 DP2 120
+   4) 流量标定：放空杯 -> CALF DP2 3 -> RUN
+
+   【加一台蠕动泵 PP2（一台泵一个485模块）】
+   1) Mega D17(TX2)->模块RXD，D16(RX2)->模块TXD，EN->D9
+   2) 安装表：ppEnPin 已预留 9；ppInstalled 第2个改 true；
+      ppAddr 第2个填泵上实际从站地址(默认0x02，同总线方案以后再议)
+   3) 若默认针脚不够，可用 Serial3(D15/D14)+EN D10 作为 PP3
+   4) 手动：PP2 SPEED 36000 / PP2 GO / PP2 STOP；标定 CALF PP2 5
+
+   【加一款奶茶 SKU2】
+   1) 容量够(SKU_MAX=5)，不需要改代码结构；
+      想要上电就有默认值，在 setDefaultConfig() 里仿照 SKU1 加：
+        cfg.recipe[1][0][0][0] = { {250,0,0,0,0,0}, {10,0,0} }; // SKU2 中杯少糖去冰
+      (第1个花括号是 DP1~DP6，第2个是 PP1~PP3)
+   2) 或者不改代码，直接在调试里用 RCP 2 0 0 0 DP1 250 PP1 10 录入，RUN 存盘
+   3) 下单：2 0 0 0
+
+   【制冰机到了】
+   只改 doIce()：ice==1 时按制冰机信号方式(继电器/485)动作；
+   配方表 ice=1 的行已存在(中杯加冰)，大杯加冰先用 RCP 补数据。
+
+   【g/s 流量怎么填】
+   方法一(推荐)：DEBUG -> 放空杯 -> CALF DP1 3(或 PP1 5)，自动算并等 RUN 存盘
+   方法二：秒表+秤手测，发 FLOW DP1 35.2 -> RUN
+   没标定(0)时出液用总重模式B，标定后自动切模式A
+   ======================================================================== */
