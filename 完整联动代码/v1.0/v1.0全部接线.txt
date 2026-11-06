@@ -1,0 +1,24 @@
+蠕动泵的485转TTL的EN接arduino mega 2560的D8
+蠕动泵的485转TTL的TXD接arduino mega 2560的D19
+蠕动泵的485转TTL的RXD接arduino mega 2560的D18
+蠕动泵的485转TTL的VCC接arduino mega 2560的POWER的5V
+蠕动泵的485转TTL的GND接arduino mega 2560的POWER的GND
+
+隔膜泵的正极接继电器的CO1端
+隔膜泵的负极接明纬电源的负极
+
+气缸的正极接继电器的CO2端
+气缸的负极接明纬电源的负极
+
+继电器的com1和com2端都接明纬电源的正极
+继电器的VCC端接明纬电源的正极
+继电器的GND端接明纬电源的负极
+继电器的IN1接arduino mega 2560的D6控制隔膜泵
+继电器的IN2接arduino mega 2560的D7控制气缸
+
+HX711的DT接arduino mega 2560的D2
+HX711的SCK接arduino mega 2560的D3
+HX711的VCC接5V电源的正极
+HX711的GND接5V电源的负极
+
+arduino mega 2560接电脑USB供电
